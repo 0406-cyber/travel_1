@@ -1,228 +1,141 @@
-import os
-import sqlite3
-from contextlib import closing
 import streamlit as st
+import pandas as pd
+import requests
 import folium
 from streamlit_folium import st_folium
 
-DB_PATH = "trip_plan.sqlite3"
+API_URL = st.secrets["API_URL"]
 
-# -------------------------
-# DB (영구 저장)
-# -------------------------
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+def api_get_all() -> pd.DataFrame:
+    r = requests.get(API_URL, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and data.get("ok") is False:
+        raise RuntimeError(data.get("error", "Unknown API error"))
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    # 타입 정리
+    df["day"] = pd.to_numeric(df["day"], errors="coerce").astype("Int64")
+    df["ord"] = pd.to_numeric(df.get("ord"), errors="coerce").fillna(0).astype(int)
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    df["id"] = df["id"].astype(str)
+    return df
 
-def init_db():
-    with closing(get_conn()) as conn, conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS places (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day INTEGER NOT NULL,
-            ord INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            lat REAL NOT NULL,
-            lng REAL NOT NULL,
-            memo TEXT DEFAULT ''
-        )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_places_day_ord ON places(day, ord)")
+def api_post(payload: dict):
+    r = requests.post(API_URL, json=payload, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("ok") is False:
+        raise RuntimeError(data.get("error", "Unknown API error"))
+    return data
 
-def fetch_places(day: int):
-    with closing(get_conn()) as conn:
-        rows = conn.execute(
-            "SELECT id, day, ord, name, lat, lng, memo FROM places WHERE day=? ORDER BY ord ASC",
-            (day,)
-        ).fetchall()
-    return rows
-
-def next_ord(day: int):
-    with closing(get_conn()) as conn:
-        row = conn.execute("SELECT COALESCE(MAX(ord), 0) FROM places WHERE day=?", (day,)).fetchone()
-        return int(row[0]) + 1
-
-def add_place(day: int, name: str, lat: float, lng: float, memo: str = ""):
-    o = next_ord(day)
-    with closing(get_conn()) as conn, conn:
-        conn.execute(
-            "INSERT INTO places(day, ord, name, lat, lng, memo) VALUES(?,?,?,?,?,?)",
-            (day, o, name, lat, lng, memo or "")
-        )
-
-def delete_place(place_id: int, day: int):
-    with closing(get_conn()) as conn, conn:
-        conn.execute("DELETE FROM places WHERE id=?", (place_id,))
-        # ord 재정렬
-        rows = conn.execute(
-            "SELECT id FROM places WHERE day=? ORDER BY ord ASC", (day,)
-        ).fetchall()
-        for i, (pid,) in enumerate(rows, start=1):
-            conn.execute("UPDATE places SET ord=? WHERE id=?", (i, pid))
-
-def move_place(day: int, place_id: int, direction: str):
-    """direction: 'up' or 'down'"""
-    with closing(get_conn()) as conn, conn:
-        rows = conn.execute(
-            "SELECT id, ord FROM places WHERE day=? ORDER BY ord ASC", (day,)
-        ).fetchall()
-        idx = next((i for i, (pid, _) in enumerate(rows) if pid == place_id), None)
-        if idx is None:
-            return
-        if direction == "up" and idx > 0:
-            rows[idx], rows[idx-1] = rows[idx-1], rows[idx]
-        elif direction == "down" and idx < len(rows) - 1:
-            rows[idx], rows[idx+1] = rows[idx+1], rows[idx]
-        else:
-            return
-        # ord 재저장
-        for i, (pid, _) in enumerate(rows, start=1):
-            conn.execute("UPDATE places SET ord=? WHERE id=?", (i, pid))
-
-# -------------------------
-# Google Maps directions link (대중교통)
-# -------------------------
-def gmaps_transit_link(origin_lat, origin_lng, dest_lat, dest_lng):
-    # 구글맵 경로 안내(대중교통)
+def gmaps_transit_link(a_lat, a_lon, b_lat, b_lon):
     return (
         "https://www.google.com/maps/dir/?api=1"
-        f"&origin={origin_lat},{origin_lng}"
-        f"&destination={dest_lat},{dest_lng}"
+        f"&origin={a_lat},{a_lon}"
+        f"&destination={b_lat},{b_lon}"
         "&travelmode=transit"
     )
 
-# -------------------------
-# Folium Map
-# -------------------------
-def build_map(day: int, places):
-    if places:
-        avg_lat = sum(r[4] for r in places) / len(places)
-        avg_lng = sum(r[5] for r in places) / len(places)
-        m = folium.Map(location=[avg_lat, avg_lng], zoom_start=13)
-    else:
-        # 장소 없을 때 기본(서울 시청 근처)
-        m = folium.Map(location=[37.5665, 126.9780], zoom_start=12)
+def build_map(day_df: pd.DataFrame):
+    if day_df.empty:
+        return folium.Map(location=[37.5665, 126.9780], zoom_start=12)
 
-    # 마커(순서 번호)
-    for (pid, d, ord_, name, lat, lng, memo) in places:
-        label = f"{ord_}. {name}"
-        popup_html = f"<b>{label}</b><br/>{memo}" if memo else f"<b>{label}</b>"
+    day_df = day_df.sort_values("ord").reset_index(drop=True)
+    m = folium.Map(location=[day_df["lat"].mean(), day_df["lon"].mean()], zoom_start=13)
+
+    coords = []
+    for i, row in day_df.iterrows():
+        coords.append((row["lat"], row["lon"]))
+        label = f'{int(row["ord"])}. {row["name"]}'
         folium.Marker(
-            location=[lat, lng],
+            [row["lat"], row["lon"]],
             tooltip=label,
-            popup=folium.Popup(popup_html, max_width=300),
-            icon=folium.DivIcon(
-                html=f"""
-                <div style="
-                    font-size: 12px;
-                    background: white;
-                    border: 1px solid #333;
-                    border-radius: 12px;
-                    padding: 2px 6px;
-                    ">
-                    {ord_}
-                </div>
-                """
-            ),
         ).add_to(m)
 
-    # 선(전체 경로)
-    coords = [(r[4], r[5]) for r in places]
     if len(coords) >= 2:
-        folium.PolyLine(
-            coords,
-            weight=5,
-            opacity=0.6,
-            tooltip="전체 동선",
-        ).add_to(m)
+        # 전체 동선
+        folium.PolyLine(coords, weight=5, opacity=0.6, tooltip="전체 동선").add_to(m)
 
-        # 구간별 선(클릭 시 해당 구간 대중교통 길찾기 링크 제공)
+        # 구간별(클릭하면 구글맵 대중교통 링크)
         for i in range(len(coords) - 1):
-            (a_lat, a_lng) = coords[i]
-            (b_lat, b_lng) = coords[i + 1]
-            link = gmaps_transit_link(a_lat, a_lng, b_lat, b_lng)
-            seg_tooltip = f"구간 {i+1} → {i+2} (클릭)"
+            a = coords[i]
+            b = coords[i + 1]
+            link = gmaps_transit_link(a[0], a[1], b[0], b[1])
             popup = folium.Popup(
-                html=f"""
-                <div style="font-size: 13px;">
-                  <b>{seg_tooltip}</b><br/>
-                  <a href="{link}" target="_blank">구글맵(대중교통)으로 경로 보기</a>
-                </div>
-                """,
+                html=f'<a href="{link}" target="_blank">구글맵(대중교통)으로 이 구간 경로 보기</a>',
                 max_width=300,
             )
             folium.PolyLine(
-                [(a_lat, a_lng), (b_lat, b_lng)],
-                weight=10,     # 클릭 잘 되게 두껍게
-                opacity=0.15,  # 너무 진하지 않게
-                tooltip=seg_tooltip,
+                [a, b],
+                weight=10,
+                opacity=0.15,  # 클릭 영역은 넓게, 보이는 건 연하게
+                tooltip=f"구간 {i+1} → {i+2} (클릭)",
                 popup=popup,
             ).add_to(m)
 
     return m
 
-# -------------------------
-# Streamlit UI
-# -------------------------
-st.set_page_config(page_title="여행 일정 플래너(1~13일)", layout="wide")
-init_db()
+st.set_page_config(page_title="여행 플래너 (Google Sheet)", layout="wide")
+st.title("🗺️ 여행 일정 플래너 (Google Sheet 기반, 무료/영구저장)")
+st.caption("Google Apps Script 웹앱(API) + Google Sheet 저장. 새로고침/재배포해도 데이터 유지.")
 
-st.title("🗺️ 여행 일정 플래너 (Streamlit + Folium)")
-st.caption("1~13일차 선택 → 지도에 장소/동선 표시 → 선(구간) 클릭 시 구글맵 대중교통 경로 안내로 이동")
+left, right = st.columns([1, 2], gap="large")
 
-col_left, col_right = st.columns([1, 2], gap="large")
-
-with col_left:
-    day = st.selectbox("📅 날짜(일차) 선택", list(range(1, 14)), index=0)
+with left:
+    day = st.selectbox("일차 선택", list(range(1, 14)), index=0)
 
     st.subheader("➕ 장소 추가")
-    with st.form("add_place_form", clear_on_submit=True):
-        name = st.text_input("장소 이름", placeholder="예: 국립중앙박물관")
-        lat = st.number_input("위도(lat)", value=37.5665, format="%.6f")
-        lng = st.number_input("경도(lng)", value=126.9780, format="%.6f")
-        memo = st.text_area("메모(선택)", placeholder="예: 10:00 입장 / 근처 점심 추천 등", height=80)
-        submitted = st.form_submit_button("추가")
-        if submitted:
+    with st.form("add_form", clear_on_submit=True):
+        name = st.text_input("장소 이름", placeholder="예: 바츨라프 광장")
+        lat = st.number_input("위도(lat)", format="%.6f", value=37.5665)
+        lon = st.number_input("경도(lon)", format="%.6f", value=126.9780)
+        add_btn = st.form_submit_button("추가")
+        if add_btn:
             if not name.strip():
                 st.error("장소 이름을 입력해줘.")
             else:
-                add_place(day, name.strip(), float(lat), float(lng), memo.strip())
+                api_post({"action": "add", "day": day, "name": name.strip(), "lat": float(lat), "lon": float(lon)})
                 st.success("추가 완료!")
                 st.rerun()
 
     st.divider()
-    st.subheader("📌 현재 선택한 날짜의 장소 목록")
+    st.subheader("📌 오늘(선택한 일차) 장소 목록")
 
-    places = fetch_places(day)
+    try:
+        df = api_get_all()
+    except Exception as e:
+        st.error(f"데이터를 불러오지 못했어: {e}")
+        st.stop()
 
-    if not places:
-        st.info("아직 장소가 없어. 위에서 추가해줘.")
+    if df.empty:
+        st.info("아직 데이터가 없어. 위에서 추가해줘.")
+        day_df = df
     else:
-        for (pid, d, ord_, name, plat, plng, pmemo) in places:
-            c1, c2, c3, c4 = st.columns([6, 2, 2, 2])
-            with c1:
-                st.write(f"**{ord_}. {name}**  \n({plat:.6f}, {plng:.6f})")
-                if pmemo:
-                    st.caption(pmemo)
-            with c2:
-                if st.button("⬆️", key=f"up_{pid}"):
-                    move_place(day, pid, "up")
-                    st.rerun()
-            with c3:
-                if st.button("⬇️", key=f"down_{pid}"):
-                    move_place(day, pid, "down")
-                    st.rerun()
-            with c4:
-                if st.button("🗑️", key=f"del_{pid}"):
-                    delete_place(pid, day)
-                    st.rerun()
+        day_df = df[df["day"] == day].sort_values("ord").reset_index(drop=True)
+        if day_df.empty:
+            st.info("이 일차에는 아직 장소가 없어.")
+        else:
+            for _, row in day_df.iterrows():
+                c1, c2, c3, c4 = st.columns([6, 2, 2, 2])
+                with c1:
+                    st.write(f'**{int(row["ord"])}. {row["name"]}**  \n({row["lat"]:.6f}, {row["lon"]:.6f})')
+                with c2:
+                    if st.button("⬆️", key=f'up_{row["id"]}'):
+                        api_post({"action": "move", "day": day, "id": row["id"], "dir": "up"})
+                        st.rerun()
+                with c3:
+                    if st.button("⬇️", key=f'down_{row["id"]}'):
+                        api_post({"action": "move", "day": day, "id": row["id"], "dir": "down"})
+                        st.rerun()
+                with c4:
+                    if st.button("🗑️", key=f'del_{row["id"]}'):
+                        api_post({"action": "delete", "day": day, "id": row["id"]})
+                        st.rerun()
 
-with col_right:
+with right:
     st.subheader(f"🗺️ {day}일차 지도")
-    places = fetch_places(day)
-    m = build_map(day, places)
-
-    # folium 렌더
-    # returned["last_object_clicked"] 등으로 확장 가능(마커 클릭 정보 활용)
-    st_folium(m, width=950, height=650)
-
-st.caption("저장은 로컬 SQLite 파일(trip_plan.sqlite3)에 기록돼서 코드 수정/새로고침 후에도 유지됩니다.")
+    m = build_map(day_df)
+    st_folium(m, height=650, use_container_width=True)
