@@ -3,3 +3,9 @@ folium
 streamlit-folium
 SQLAlchemy
 psycopg2-binary
+requests
+pandas
+
+
+
+
